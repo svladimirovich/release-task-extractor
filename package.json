@@ -1,0 +1,17 @@
+{
+  "name": "release-task-extractor",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^0.27.1",
+    "command-line-args": "^5.2.1",
+    "nodegit": "^0.27.0"
+  }
+}
