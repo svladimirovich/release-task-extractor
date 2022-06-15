@@ -56,9 +56,7 @@ if (!targetRepository) {
 }
 
 void async function main() {
-    console.log("step", 0);
     const projectKeys = await getProjectKeys();
-    console.log("step", 1);
     const taskPattern = new RegExp(`(${projectKeys.join('|')})[-_\\s]?(\\d+)`, 'gmi');
 
     function getCommitByTagName(repo, tagName) {
@@ -120,18 +118,14 @@ void async function main() {
     }
 
     const repo = await Git.Repository.open(targetRepository);
-    console.log("step", 2);
 
     const targetCommit = await getCommitByTagName(repo, targetTag);
-    console.log("step", 3);
 
     const tag_oid = targetCommit.id();
 
     const branch = await repo.getCurrentBranch();
-    console.log("step", 4);
 
     const commit = await repo.getBranchCommit(branch.shorthand());
-    console.log("step", 5);
 
     const history = commit.history();
     let isDone = false;
