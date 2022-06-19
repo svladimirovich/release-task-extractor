@@ -1,10 +1,26 @@
-const Git = require("nodegit");
+const { openRepository } = require('./git-tools');
+const { excludeCommitsDownToSpecificSha } = require('./commit-inclusion-analyzer');
 const commandLineArgs = require('command-line-args');
 
 const commandLineDefinitions = [
     {
         name: 'repository',
         alias: 'r',
+        type: String,
+    },
+    {
+        name: 'branch',
+        alias: 'b',
+        type: String,
+    },
+    {
+        name: 'previous-version-branch',
+        alias: 'e',
+        type: String,
+    },
+    {
+        name: 'final-sha',
+        alias: 'c',
         type: String,
     },
     {
@@ -33,128 +49,76 @@ const commandLineDefinitions = [
 ];
 
 const options = commandLineArgs(commandLineDefinitions);
+let errorNumber = 0;
 console.log("running task extractor with options", options);
 
-const jira = require('./jira.js').client({
-    host: options["jira-host"],
-    user: options["jira-user"],
-    password: options["jira-password"],
-});
+if (!options["repository"]) {
+    console.log("must specify --repository in order to run this");
+    errorNumber = errorNumber | 1;
+}
 
-const targetRepository = options["repository"];
-const targetTag = options["final-tag"];
+if (!options["branch"]) {
+    console.log("must specify --branch in order to run this");
+    errorNumber = errorNumber | 2;
+}
 
-function getProjectKeys() {
-    return jira.getProjects().then(projects => {
-        return projects.map(p => p.key);
+if (!(options["previous-version-branch"] || options["final-sha"] || options["final-tag"])) {
+    console.log("must specify --previous-version-branch or --final-sha or --final-tag in order to run this");
+    errorNumber = errorNumber | 4;
+}
+
+if (!(options["jira-host"] && options["jira-user"] && options["jira-password"])) {
+    console.log("make sure you specified jira credentials: --jira-host, --jira-user and --jira-password");
+    errorNumber = errorNumber | 8;
+}
+
+if (errorNumber > 0) {
+    process.exit(errorNumber);
+}
+
+void async function() {
+    const git = await openRepository(options["repository"]);
+
+    let targetSha = options["final-sha"];
+
+    const commits = await git.extractCommits(options["branch"]);
+    let filteredCommits = null;
+
+    if (options["previous-version-branch"]) {
+        // make a dictionary out of previous version commits
+        const previousVersionCommitsShaDictionary = (await git.extractCommits(options["previous-version-branch"])).reduce((acc, next) => {
+            acc[next.sha] = true;
+            return acc;
+        }, {});
+        // exclude previous version commits from the full set of current version commits
+        filteredCommits = commits.filter(commit => !previousVersionCommitsShaDictionary[commit.sha]);
+    } else {
+        // exclude commits down until specific sha (or tag)
+        if (!targetSha) {
+            targetSha = await git.getShaByTag(options["final-tag"]);
+        }
+        filteredCommits = excludeCommitsDownToSpecificSha(commits, targetSha);
+    }
+
+    console.log("Filtered Commits:", filteredCommits.map(c => ({
+        sha: c.sha, message: c.message
+    })));
+
+    const jira = await require('./jira-tools.js').create({
+        host: options["jira-host"],
+        user: options["jira-user"],
+        password: options["jira-password"],
     });
-}
 
-if (!targetRepository) {
-    console.log("Please specify a repository");
-    process.exit();
-}
-
-void async function main() {
-    const projectKeys = await getProjectKeys();
-    const taskPattern = new RegExp(`(${projectKeys.join('|')})[-_\\s]?(\\d+)`, 'gmi');
-
-    function getCommitByTagName(repo, tagName) {
-        return Git.Reference.lookup(repo, `refs/tags/${tagName}`)
-            .then(ref => ref.peel(Git.Object.TYPE.COMMIT))
-            .then(ref => Git.Commit.lookup(repo, ref.id()));
-    }
-
-    function extractCommitInfo(commit) {
-        const author = commit.author();
-        const sha = commit.sha().slice(0,8);
-        const date = commit.date().toISOString().slice(0,16).replace("T"," ");
-        const message = String(commit.message()).trim();
-        return {
-            sha,
-            date,
-            author: {
-                name: author.name(),
-                email: author.email(),
-            },
-            message,
-        }
-    }
-    
-    function extractTicketName(commitMessage, pattern) {
-        const regex = pattern;
-        let result = [];
-        let m;
-        while ((m = regex.exec(commitMessage)) !== null) {
-            // This is necessary to avoid infinite loops with zero-width matches
-            if (m.index === regex.lastIndex) {
-                regex.lastIndex++;
-            }
-            result.push(`${m[1].toUpperCase()}-${m[2]}`)
-        }
-        return result;
-    }
-
-    async function enrichWithTaskInfoFromJira(ticketId, task) {
-        let taskInfo = null;
-        try {
-            taskInfo = await jira.getTask(ticketId)
-        } catch (error) {
-            console.error("error requesting info for task:", ticketId);
-            return task;
-        }
-
-        Object.assign(task, {
-            taskId: ticketId,
-            creator: taskInfo?.fields?.creator?.displayName,
-            assignee: taskInfo?.fields?.assignee?.displayName,
-            status: taskInfo?.fields?.status?.name,
-            issuetype: taskInfo?.fields?.issuetype?.name,
-            project: taskInfo?.fields?.project?.name,
-            summary: taskInfo?.fields?.summary,   
+    const tasks = jira.extractTasksFromCommits(filteredCommits);
+    for (const [taskId, task] of Object.entries(tasks)) {
+        console.log(`Requesting task info ${taskId} from JIRA`);
+        const jiraInfo = await jira.getTaskInfoFromJira(taskId).catch(error => {
+            console.log(`Error while retrieving info for task ${taskId} from JIRA: ${String(error).substring(0, 30)}`);
+            return {};
         });
-
-        return task;
+        Object.assign(task, jiraInfo);
     }
 
-    const repo = await Git.Repository.open(targetRepository);
-
-    const targetCommit = await getCommitByTagName(repo, targetTag);
-
-    const tag_oid = targetCommit.id();
-
-    const branch = await repo.getCurrentBranch();
-
-    const commit = await repo.getBranchCommit(branch.shorthand());
-
-    const history = commit.history();
-    let isDone = false;
-    let tasks = {};
-    history.on("commit", async commit => {
-        if (commit.id().equal(tag_oid)) {
-            // target tag is reached
-            isDone = true;
-            for(let key in tasks) {
-                tasks[key] = await enrichWithTaskInfoFromJira(key, tasks[key]);
-                console.log(`${key} - ${tasks[key].summary}`);
-            }
-            wrapUp(tasks);
-        } else if (!isDone) {
-            const tickets = extractTicketName(commit.message(), taskPattern);
-            tickets.forEach(ticket => {
-                if (!tasks[ticket]) {
-                    tasks[ticket] = {
-                        commits: []
-                    };
-                }
-                tasks[ticket].commits.push(extractCommitInfo(commit));
-            });
-        }
-    });
-    history.start();
-
-    function wrapUp(tasks) {
-        // TODO: maybe save result into some json file?
-    }
+    console.log("total commits", commits.length, "filtered commits", filteredCommits.length);
 }();
-
